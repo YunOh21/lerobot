@@ -32,6 +32,57 @@ import torch
 
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
+# ----------------- Add Event Head Wrapper -------------------
+import torch.nn as nn
+import torch.nn.functional as F
+
+class EventHeadWrapper(nn.Module):
+    def __init__(self, policy_model, feature_dim, num_classes=2, hidden_dim=256, use_cls=False):
+        super().__init__()
+        self.policy = policy_model.eval()
+        self.use_cls = use_cls
+        self.event_head = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+        for p in self.event_head.parameters():
+            p.requires_grad = False
+        self._vision_feat = None
+    
+    def _register_vision_hook(self):
+        vision_module = getattr(self.policy, "vision_backbone", None)
+        assert vision_module is not None, "policy 안에 vision_backbone 없음!"
+
+        # SigLIP 구조: vision_backbone.encoder.layers[-1]
+        target = vision_module.encoder.layers[-1]
+
+        def _hook(_, __, output):
+            self._vision_feat = output
+            print("VISION FEATURE SHAPE:", output.shape)
+
+        target.register_forward_hook(_hook)
+
+
+    def _pool(self, feat):
+        if feat.dim() == 3:
+            return feat[:, 0] if self.use_cls else feat.mean(dim=1)
+        elif feat.dim() == 2:
+            return feat
+        elif feat.dim() == 4:
+            return F.adaptive_avg_pool2d(feat, 1).flatten(1)
+        else:
+            raise ValueError
+
+    @torch.no_grad()
+    def forward(self, obs):
+        action = self.policy.select_action(obs)
+        feat = self._pool(self._vision_feat) if self._vision_feat is not None else None
+        event_logits = self.event_head(feat) if feat is not None else None
+        return action, event_logits
+
+# ----------- End of Event Head Wrapper Class ------------
+
 # Create a directory to store the video of the evaluation
 output_directory = Path("outputs/eval/example_pusht_diffusion")
 output_directory.mkdir(parents=True, exist_ok=True)
@@ -79,6 +130,11 @@ frames.append(env.render())
 
 step = 0
 done = False
+
+# --------------- Instantiate EventHeadWrapper --------------------------
+wrapped_policy = EventHeadWrapper(policy, feature_dim=768, num_classes=2)
+wrapped_policy._register_vision_hook()
+
 while not done:
     # Prepare observation for the policy running in Pytorch
     state = torch.from_numpy(numpy_observation["agent_pos"])
@@ -106,7 +162,10 @@ while not done:
 
     # Predict the next action with respect to the current observation
     with torch.inference_mode():
-        action = policy.select_action(observation)
+        action, event_logits = wrapped_policy(observation)
+
+    if event_logits is not None:
+        print("Event logits:", event_logits)
 
     # Prepare the action for the environment
     numpy_action = action.squeeze(0).to("cpu").numpy()
